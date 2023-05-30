@@ -4,10 +4,11 @@
 2.0 authentication. Designed for apps/clients that don't support OAuth 2.0 but need to connect to modern servers."""
 
 __author__ = 'Simon Robinson'
-__copyright__ = 'Copyright (c) 2022 Simon Robinson'
+__copyright__ = 'Copyright (c) 2023 Simon Robinson'
 __license__ = 'Apache 2.0'
-__version__ = '2023-02-16'  # ISO 8601 (YYYY-MM-DD)
+__version__ = '2023-05-18'  # ISO 8601 (YYYY-MM-DD)
 
+import abc
 import argparse
 import base64
 import binascii
@@ -66,7 +67,8 @@ no_gui_parser.add_argument('--no-gui', action='store_true')
 no_gui_parser.add_argument('--external-auth', action='store_true')
 no_gui_args = no_gui_parser.parse_known_args()[0]
 if not no_gui_args.no_gui:
-    import pkg_resources  # from setuptools - used to check package versions and choose compatible methods
+    # noinspection PyDeprecation
+    import pkg_resources  # from setuptools - to be changed to importlib.metadata and packaging.version once 3.8 is min.
     import pystray  # the menu bar/taskbar GUI
     import timeago  # the last authenticated activity hint
     from PIL import Image, ImageDraw, ImageFont  # draw the menu bar icon from the TTF font stored in APP_ICON
@@ -123,7 +125,7 @@ CENSOR_MESSAGE = b'[[ Credentials removed from proxy log ]]'  # replaces actual 
 script_path = sys.executable if getattr(sys, 'frozen', False) else os.path.realpath(__file__)  # for pyinstaller etc
 if sys.platform == 'darwin' and '.app/Contents/MacOS/' in script_path:  # pyinstaller .app binary is within the bundle
     script_path = '/'.join(script_path.split('Contents/MacOS/')[0].split('/')[:-1])
-CONFIG_FILE_PATH = os.path.join(os.path.dirname(script_path), '%s.config' % APP_SHORT_NAME)
+CONFIG_FILE_PATH = CACHE_STORE = os.path.join(os.path.dirname(script_path), '%s.config' % APP_SHORT_NAME)
 CONFIG_SERVER_MATCHER = re.compile(r'^(?P<type>(IMAP|POP|SMTP))-(?P<port>\d+)$')
 
 MAX_CONNECTIONS = 0  # maximum concurrent IMAP/POP/SMTP connections; 0 = no limit; limit is per server
@@ -146,11 +148,11 @@ TOKEN_EXPIRY_MARGIN = 600  # seconds before its expiry to refresh the OAuth 2.0 
 LOG_FILE_MAX_SIZE = 32 * 1024 * 1024  # when using a log file, its maximum size in bytes before rollover (0 = no limit)
 LOG_FILE_MAX_BACKUPS = 10  # the number of log files to keep when LOG_FILE_MAX_SIZE is exceeded (0 = disable rollover)
 
-IMAP_TAG_PATTERN = r"[!#$&',-\[\]-z|}~]+"  # https://ietf.org/rfc/rfc9051.html#name-formal-syntax
-IMAP_AUTHENTICATION_REQUEST_MATCHER = re.compile(
-    r'^(?P<tag>%s) (?P<command>(LOGIN|AUTHENTICATE)) (?P<flags>.*)$' % IMAP_TAG_PATTERN, flags=re.IGNORECASE)
+IMAP_TAG_PATTERN = r'[!#$&\',-\[\]-z|}~]+'  # https://ietf.org/rfc/rfc9051.html#name-formal-syntax
+IMAP_AUTHENTICATION_REQUEST_MATCHER = re.compile('^(?P<tag>%s) (?P<command>(LOGIN|AUTHENTICATE)) '
+                                                 '(?P<flags>.*)$' % IMAP_TAG_PATTERN, flags=re.IGNORECASE)
 IMAP_LITERAL_MATCHER = re.compile(r'^{(?P<length>\d+)(?P<continuation>\+?)}$')
-IMAP_CAPABILITY_MATCHER = re.compile(r'^(?:\* |\* OK \[)CAPABILITY .*$', flags=re.IGNORECASE)  # note: '* ' and '* OK ['
+IMAP_CAPABILITY_MATCHER = re.compile(r'^\* (?:OK \[)?CAPABILITY .*$', flags=re.IGNORECASE)  # note: '* ' *and* '* OK ['
 
 REQUEST_QUEUE = queue.Queue()  # requests for authentication
 RESPONSE_QUEUE = queue.Queue()  # responses from user
@@ -210,7 +212,8 @@ class Log:
         Log._LOGGER = logging.getLogger(APP_NAME)
         if log_file or sys.platform == 'win32':
             handler = logging.handlers.RotatingFileHandler(
-                log_file or '%s/%s.log' % (os.path.dirname(os.path.realpath(__file__)), APP_SHORT_NAME),
+                log_file or '%s/%s.log' % (os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else
+                                                           os.path.realpath(__file__)), APP_SHORT_NAME),
                 maxBytes=LOG_FILE_MAX_SIZE, backupCount=LOG_FILE_MAX_BACKUPS)
             handler.setFormatter(logging.Formatter('%(asctime)s: %(message)s'))
         elif sys.platform == 'darwin':
@@ -271,6 +274,124 @@ class Log:
     def error_string(error):
         return getattr(error, 'message', repr(error))
 
+    @staticmethod
+    def get_last_error():
+        error_type, value, _traceback = sys.exc_info()
+        del _traceback  # used to be required in python 2; may no-longer be needed, but best to be safe
+        return error_type, value  # note that if no exception has currently been raised, this will return `None, None`
+
+
+class CacheStore(abc.ABC):
+    """Override this class to provide additional cache store options for a dictionary of OAuth 2.0 credentials, then add
+    an entry in AppConfig's `_EXTERNAL_CACHE_STORES` to make them available via the proxy's `--cache-store` parameter"""
+
+    @staticmethod
+    @abc.abstractmethod
+    def load(store_id):
+        return {}
+
+    @staticmethod
+    @abc.abstractmethod
+    def save(store_id, config_dict):
+        pass
+
+
+class AWSSecretsManagerCacheStore(CacheStore):
+    # noinspection PyGlobalUndefined,PyPackageRequirements
+    @staticmethod
+    def _get_boto3_client(store_id):
+        try:
+            global boto3, botocore
+            import boto3
+            import botocore.exceptions
+        except ModuleNotFoundError:
+            Log.error('Unable to load AWS SDK - please install the `boto3` module: `python -m pip install boto3`')
+            return None, None
+        else:
+            # allow a profile to be chosen by prefixing the store_id - the separator used (`||`) will not be in an ARN
+            # or secret name (see: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CreateSecret.html)
+            split_id = store_id.split('||', maxsplit=1)
+            if '||' in store_id:
+                return split_id[1], boto3.session.Session(profile_name=split_id[0]).client('secretsmanager')
+            return store_id, boto3.client(service_name='secretsmanager')
+
+    @staticmethod
+    def _create_secret(aws_client, store_id):
+        if store_id.startswith('arn:'):
+            Log.info('Creating new AWS Secret "%s" failed - it is not possible to choose specific ARNs for new secrets')
+            return False
+
+        try:
+            aws_client.create_secret(Name=store_id, ForceOverwriteReplicaSecret=False)
+            Log.info('Created new AWS Secret "%s"' % store_id)
+            return True
+
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'AccessDeniedException':
+                AWSSecretsManagerCacheStore._log_error(
+                    'Creating new AWS Secret "%s" failed - access denied: does the IAM user have the '
+                    '`secretsmanager:CreateSecret` permission?' % store_id, e)
+            else:
+                AWSSecretsManagerCacheStore._log_error('Creating new AWS Secret "%s" failed with an unexpected error; '
+                                                       'see the proxy\'s debug log' % store_id, e)
+        return False
+
+    @staticmethod
+    def _log_error(error_message, debug_error):
+        Log.debug('AWS %s: %s' % (debug_error.response['Error']['Code'], debug_error.response['Error']['Message']))
+        Log.error(error_message)
+
+    @staticmethod
+    def load(store_id):
+        store_id, aws_client = AWSSecretsManagerCacheStore._get_boto3_client(store_id)
+        if aws_client:
+            try:
+                Log.debug('Requesting credential cache from AWS Secret "%s"' % store_id)
+                retrieved_secrets = json.loads(aws_client.get_secret_value(SecretId=store_id)['SecretString'])
+                Log.info('Fetched', len(retrieved_secrets), 'cached account entries from AWS Secret "%s"' % store_id)
+                return retrieved_secrets
+
+            except botocore.exceptions.ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'ResourceNotFoundException':
+                    Log.info('AWS Secret "%s" does not exist - attempting to create it' % store_id)
+                    AWSSecretsManagerCacheStore._create_secret(aws_client, store_id)
+                elif error_code == 'AccessDeniedException':
+                    AWSSecretsManagerCacheStore._log_error(
+                        'Fetching AWS Secret "%s" failed - access denied: does the IAM user have the '
+                        '`secretsmanager:GetSecretValue` permission?' % store_id, e)
+                else:
+                    AWSSecretsManagerCacheStore._log_error(
+                        'Fetching AWS Secret "%s" failed - unexpected error; see the proxy debug log' % store_id, e)
+        else:
+            Log.error('Unable to get AWS SDK client; cannot fetch credentials from AWS Secrets Manager')
+        return {}
+
+    @staticmethod
+    def save(store_id, config_dict, create_secret=True):
+        store_id, aws_client = AWSSecretsManagerCacheStore._get_boto3_client(store_id)
+        if aws_client:
+            try:
+                Log.debug('Saving credential cache to AWS Secret "%s"' % store_id)
+                aws_client.put_secret_value(SecretId=store_id, SecretString=json.dumps(config_dict))
+                Log.info('Cached', len(config_dict), 'account entries to AWS Secret "%s"' % store_id)
+
+            except botocore.exceptions.ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'ResourceNotFoundException' and create_secret:
+                    Log.info('AWS Secret "%s" does not exist - attempting to create it' % store_id)
+                    if AWSSecretsManagerCacheStore._create_secret(aws_client, store_id):
+                        AWSSecretsManagerCacheStore.save(store_id, config_dict, create_secret=False)
+                elif error_code == 'AccessDeniedException':
+                    AWSSecretsManagerCacheStore._log_error(
+                        'Caching to AWS Secret "%s" failed - access denied: does the IAM user have the '
+                        '`secretsmanager:PutSecretValue` permission?' % store_id, e)
+                else:
+                    AWSSecretsManagerCacheStore._log_error(
+                        'Caching to AWS Secret "%s" failed - unexpected error; see the proxy debug log' % store_id, e)
+        else:
+            Log.error('Unable to get AWS SDK client; cannot cache credentials to AWS Secrets Manager')
+
 
 class AppConfig:
     """Helper wrapper around ConfigParser to cache servers/accounts, and avoid writing to the file until necessary"""
@@ -281,6 +402,13 @@ class AppConfig:
     _GLOBALS = None
     _SERVERS = []
     _ACCOUNTS = []
+
+    # note: removing the unencrypted version of `client_secret_encrypted` is not automatic with --cache-store (see docs)
+    _CACHED_OPTION_KEYS = ['token_salt', 'access_token', 'access_token_expiry', 'refresh_token', 'last_activity',
+                           'client_secret_encrypted']
+
+    # additional cache stores may be implemented by extending CacheStore and adding a prefix entry in this dict
+    _EXTERNAL_CACHE_STORES = {'aws:': AWSSecretsManagerCacheStore}
 
     @staticmethod
     def _load():
@@ -293,9 +421,39 @@ class AppConfig:
             AppConfig._GLOBALS = AppConfig._PARSER[APP_SHORT_NAME]
         else:
             AppConfig._GLOBALS = configparser.SectionProxy(AppConfig._PARSER, APP_SHORT_NAME)
+
+        # cached account credentials can be stored in the configuration file (default) or, via `--cache-store`, a
+        # separate local file or external service (such as a secrets manager) - we combine these sources at load time
+        if CACHE_STORE != CONFIG_FILE_PATH:
+            # it would be cleaner to avoid specific options here, but best to load unexpected sections only when enabled
+            allow_catch_all_accounts = AppConfig._GLOBALS.getboolean('allow_catch_all_accounts', fallback=False)
+
+            cache_file_parser = AppConfig._load_cache(CACHE_STORE)
+            cache_file_accounts = [s for s in cache_file_parser.sections() if '@' in s]
+            for account in cache_file_accounts:
+                if allow_catch_all_accounts and account not in AppConfig._PARSER.sections():  # missing sub-accounts
+                    AppConfig._PARSER.add_section(account)
+                for option in cache_file_parser.options(account):
+                    if option in AppConfig._CACHED_OPTION_KEYS:
+                        AppConfig._PARSER.set(account, option, cache_file_parser.get(account, option))
+
+            if allow_catch_all_accounts:
+                config_sections = AppConfig._PARSER.sections()  # new sections may have been added
+
         AppConfig._SERVERS = [s for s in config_sections if CONFIG_SERVER_MATCHER.match(s)]
         AppConfig._ACCOUNTS = [s for s in config_sections if '@' in s]
+
         AppConfig._LOADED = True
+
+    @staticmethod
+    def _load_cache(cache_store_identifier):
+        cache_file_parser = configparser.ConfigParser()
+        for prefix, cache_store_handler in AppConfig._EXTERNAL_CACHE_STORES.items():
+            if cache_store_identifier.startswith(prefix):
+                cache_file_parser.read_dict(cache_store_handler.load(cache_store_identifier[len(prefix):]))
+                return cache_file_parser
+        cache_file_parser.read(cache_store_identifier)  # default cache is a local file (does not error if non-existent)
+        return cache_file_parser
 
     @staticmethod
     def get():
@@ -340,8 +498,43 @@ class AppConfig:
     @staticmethod
     def save():
         if AppConfig._LOADED:
-            with open(CONFIG_FILE_PATH, mode='w', encoding='utf-8') as config_output:
-                AppConfig._PARSER.write(config_output)
+            if CACHE_STORE != CONFIG_FILE_PATH:
+                # in `--cache-store` mode we ignore everything except _CACHED_OPTION_KEYS (OAuth 2.0 tokens, etc)
+                output_config_parser = configparser.ConfigParser()
+                output_config_parser.read_dict(AppConfig._PARSER)  # a deep copy of the current configuration
+
+                for account in AppConfig._ACCOUNTS:
+                    for option in output_config_parser.options(account):
+                        if option not in AppConfig._CACHED_OPTION_KEYS:
+                            output_config_parser.remove_option(account, option)
+
+                for section in output_config_parser.sections():
+                    if section not in AppConfig._ACCOUNTS or len(output_config_parser.options(section)) <= 0:
+                        output_config_parser.remove_section(section)
+
+                AppConfig._save_cache(CACHE_STORE, output_config_parser)
+
+            else:
+                # by default we cache to the local configuration file, and rewrite all values each time
+                try:
+                    with open(CONFIG_FILE_PATH, mode='w', encoding='utf-8') as config_output:
+                        AppConfig._PARSER.write(config_output)
+                except IOError:
+                    Log.error('Error saving state to config file at', CONFIG_FILE_PATH, '- is the file writable?')
+
+    @staticmethod
+    def _save_cache(cache_store_identifier, output_config_parser):
+        for prefix, cache_store_handler in AppConfig._EXTERNAL_CACHE_STORES.items():
+            if cache_store_identifier.startswith(prefix):
+                cache_store_handler.save(cache_store_identifier[len(prefix):],
+                                         {account: dict(output_config_parser.items(account)) for account in
+                                          output_config_parser.sections()})
+                return
+        try:
+            with open(cache_store_identifier, mode='w', encoding='utf-8') as config_output:
+                output_config_parser.write(config_output)
+        except IOError:
+            Log.error('Error saving state to cache store file at', cache_store_identifier, '- is the file writable?')
 
 
 class OAuth2Helper:
@@ -407,13 +600,22 @@ class OAuth2Helper:
         access_token_expiry = config.getint(username, 'access_token_expiry', fallback=current_time)
         refresh_token = config.get(username, 'refresh_token', fallback=None)
 
+        # try reloading remotely cached tokens if possible
+        if not access_token and CACHE_STORE != CONFIG_FILE_PATH and recurse_retries:
+            AppConfig.reload()
+            return OAuth2Helper.get_oauth2_credentials(username, password, recurse_retries=False)
+
         # we hash locally-stored tokens with the given password
         if not token_salt:
             token_salt = base64.b64encode(os.urandom(16)).decode('utf-8')
 
         # generate encrypter/decrypter based on password and random salt
-        key_derivation_function = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
-                                             salt=base64.b64decode(token_salt.encode('utf-8')), iterations=100000,
+        try:
+            decoded_salt = base64.b64decode(token_salt.encode('utf-8'))  # catch incorrect third-party proxy guide
+        except binascii.Error:
+            return (False, '%s: Invalid `token_salt` value found in config file entry for account %s - this value is '
+                           'not intended to be manually created; please remove and retry' % (APP_NAME, username))
+        key_derivation_function = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=decoded_salt, iterations=100000,
                                              backend=default_backend())
         fernet = Fernet(base64.urlsafe_b64encode(key_derivation_function.derive(password.encode('utf-8'))))
 
@@ -566,7 +768,7 @@ class OAuth2Helper:
         class RedirectionReceiverWSGIApplication:
             def __call__(self, environ, start_response):
                 start_response('200 OK', [('Content-type', 'text/html; charset=utf-8')])
-                token_request['response_url'] = token_request['redirect_uri'].rstrip('/') + environ.get(
+                token_request['response_url'] = '/'.join(token_request['redirect_uri'].split('/')[0:3]) + environ.get(
                     'PATH_INFO') + '?' + environ.get('QUERY_STRING')
                 return [('<html><head><title>%s authentication complete (%s)</title><style type="text/css">body{margin:'
                          '20px auto;line-height:1.3;font-family:sans-serif;font-size:16px;color:#444;padding:0 24px}'
@@ -750,7 +952,7 @@ class OAuth2Helper:
     def strip_quotes(text):
         """Remove double quotes (i.e., " characters) around a string - used for IMAP LOGIN command"""
         if text.startswith('"') and text.endswith('"'):
-            return text[1:-1].replace('\\"', '"')  # also need to fix any escaped quotes within the string
+            return text[1:-1].replace(r'\"', '"')  # also need to fix any escaped quotes within the string
         return text
 
     @staticmethod
@@ -812,7 +1014,7 @@ class SSLAsyncoreDispatcher(asyncore.dispatcher_with_send):
         except ssl.SSLWantWriteError:
             select.select([], [self.socket], [], 0.01)  # wait for the socket to be writable (10ms timeout)
         except self.ssl_handshake_errors:  # also includes SSLWant[Read/Write]Error, but already handled above
-            self.handle_close()
+            self.close()
         else:
             if not self.ssl_handshake_completed:  # only notify once (we may need to repeat the handshake later)
                 Log.debug(self.info_string(), '<-> [', self.socket.version(), 'handshake complete ]')
@@ -860,14 +1062,13 @@ class SSLAsyncoreDispatcher(asyncore.dispatcher_with_send):
         return 0
 
     def handle_error(self):
-        error_type, value, _traceback = sys.exc_info()
-        del _traceback  # used to be required in python 2; may no-longer be needed, but best to be safe
         if self.ssl_connection:
             # OSError 0 ('Error') and SSL errors here are caused by connection handshake failures or timeouts
             # APP_PACKAGE is used when we throw our own SSLError on handshake timeout or socket misconfiguration
             ssl_errors = ['SSLV3_ALERT_BAD_CERTIFICATE', 'PEER_DID_NOT_RETURN_A_CERTIFICATE', 'WRONG_VERSION_NUMBER',
                           'CERTIFICATE_VERIFY_FAILED', 'TLSV1_ALERT_PROTOCOL_VERSION', 'TLSV1_ALERT_UNKNOWN_CA',
-                          APP_PACKAGE]
+                          'UNSUPPORTED_PROTOCOL', APP_PACKAGE]
+            error_type, value = Log.get_last_error()
             if error_type == OSError and value.errno == 0 or issubclass(error_type, ssl.SSLError) and \
                     any(i in value.args[1] for i in ssl_errors):
                 Log.error('Caught connection error in', self.info_string(), ':', error_type, 'with message:', value)
@@ -882,7 +1083,7 @@ class SSLAsyncoreDispatcher(asyncore.dispatcher_with_send):
                                   'self-signed certificates, but these may still need an exception in your client')
                 Log.error('If you encounter this error repeatedly, please check that you have correctly configured',
                           'python root certificates; see: https://github.com/simonrob/email-oauth2-proxy/issues/14')
-                self.handle_close()
+                self.close()
             else:
                 super().handle_error()
         else:
@@ -956,11 +1157,12 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
                 else:
                     # IMAP LOGIN command with inline username/password, POP PASS and IMAP/POP/SMTP AUTH(ENTICATE)
                     tag_pattern = IMAP_TAG_PATTERN.encode('utf-8')
-                    log_data = re.sub(b'(%s) (LOGIN) (.*)\r\n' % tag_pattern, b'\\1 \\2 %s\r\n' % CENSOR_MESSAGE,
-                                      line, flags=re.IGNORECASE)
-                    log_data = re.sub(b'(PASS) (.*)\r\n', b'\\1 %s\r\n' % CENSOR_MESSAGE, log_data, flags=re.IGNORECASE)
-                    log_data = re.sub(b'(%s)?( ?)(AUTH)(ENTICATE)? (PLAIN|LOGIN) (.*)\r\n' % tag_pattern,
-                                      b'\\1\\2\\3\\4 \\5 %s\r\n' % CENSOR_MESSAGE, log_data, flags=re.IGNORECASE)
+                    log_data = re.sub(b'(%s) (LOGIN) (.*)\r\n' % tag_pattern,
+                                      br'\1 \2 ' + CENSOR_MESSAGE + b'\r\n', line, flags=re.IGNORECASE)
+                    log_data = re.sub(b'(PASS) (.*)\r\n',
+                                      br'\1 ' + CENSOR_MESSAGE + b'\r\n', log_data, flags=re.IGNORECASE)
+                    log_data = re.sub(b'(%s)?( )?(AUTH)(ENTICATE)? (PLAIN|LOGIN) (.*)\r\n' % tag_pattern,
+                                      br'\1\2\3\4 \5 ' + CENSOR_MESSAGE + b'\r\n', log_data, flags=re.IGNORECASE)
 
                 Log.debug(self.info_string(), '-->', log_data)
                 try:
@@ -988,7 +1190,9 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
             Log.info(self.info_string(), 'Caught asyncore info message (client) -', message_type, ':', message)
 
     def handle_close(self):
-        Log.debug(self.info_string(), '--> [ Client disconnected ]')
+        error_type, value = Log.get_last_error()
+        if error_type and value:
+            Log.info(self.info_string(), 'Caught connection error (client) -', error_type.__name__, ':', value)
         self.close()
 
     def close(self):
@@ -999,6 +1203,7 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
             self.server_connection = None
         self.proxy_parent.remove_client(self)
         with contextlib.suppress(OSError):
+            Log.debug(self.info_string(), '<-- [ Server disconnected ]')
             super().close()
 
 
@@ -1305,8 +1510,14 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
         self.authenticated_username = None  # used only for showing last activity in the menu
         self.last_activity = 0
 
-        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.create_socket()
         self.connect(self.server_address)
+
+    def create_socket(self, socket_family=socket.AF_UNSPEC, socket_type=socket.SOCK_STREAM):
+        # connect to whichever resolved IPv4 or IPv6 address is returned first by the system
+        for a in socket.getaddrinfo(self.server_address[0], self.server_address[1], socket_family, socket.SOCK_STREAM):
+            super().create_socket(a[0], socket.SOCK_STREAM)
+            return
 
     def info_string(self):
         debug_string = '; %s:%d->%s:%d' % (self.connection_info[0], self.connection_info[1], self.server_address[0],
@@ -1383,8 +1594,7 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
         return super().send(byte_data)
 
     def handle_error(self):
-        error_type, value, _traceback = sys.exc_info()
-        del _traceback  # used to be required in python 2; may no-longer be needed, but best to be safe
+        error_type, value = Log.get_last_error()
         if error_type == TimeoutError and value.errno == errno.ETIMEDOUT or \
                 issubclass(error_type, ConnectionError) and value.errno in [errno.ECONNRESET, errno.ECONNREFUSED] or \
                 error_type == OSError and value.errno in [0, errno.ENETDOWN, errno.EHOSTUNREACH]:
@@ -1392,7 +1602,7 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
             # refused;  OSError 0 = 'Error' (typically network failure), 50 = 'Network is down', 65 = 'No route to host'
             Log.info(self.info_string(), 'Caught network error (server) - is there a network connection?',
                      'Error type', error_type, 'with message:', value)
-            self.handle_close()
+            self.close()
         else:
             super().handle_error()
 
@@ -1402,7 +1612,13 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
             Log.info(self.info_string(), 'Caught asyncore info message (server) -', message_type, ':', message)
 
     def handle_close(self):
-        Log.debug(self.info_string(), '<-- [ Server disconnected ]')
+        error_type, value = Log.get_last_error()
+        if error_type and value:
+            message = 'Caught connection error (server)'
+            if error_type == OSError and value.errno in [errno.ENOTCONN, 10057]:
+                # OSError 57 or 10057 = 'Socket is not connected'
+                message = '%s [ Client attempted to send command without waiting for server greeting ]' % message
+            Log.info(self.info_string(), message, '-', error_type.__name__, ':', value)
         self.close()
 
     def close(self):
@@ -1412,6 +1628,7 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
                 self.client_connection.close()
             self.client_connection = None
         with contextlib.suppress(OSError):
+            Log.debug(self.info_string(), '--> [ Client disconnected ]')
             super().close()
 
 
@@ -1440,16 +1657,16 @@ class IMAPOAuth2ServerConnection(OAuth2ServerConnection):
 
         # intercept pre-auth CAPABILITY response to advertise only AUTH=PLAIN (+SASL-IR) and re-enable LOGIN if required
         if IMAP_CAPABILITY_MATCHER.match(str_response):
-            capability = r"[!#$&'+-\[^-z|}~]+"  # https://ietf.org/rfc/rfc9051.html#name-formal-syntax
-            updated_response = re.sub(r'( AUTH=' + capability + r')+', ' AUTH=PLAIN', str_response, flags=re.IGNORECASE)
-            if not re.search(r' AUTH=PLAIN', updated_response, re.IGNORECASE):
+            capability = r'[!#$&\'+-\[^-z|}~]+'  # https://ietf.org/rfc/rfc9051.html#name-formal-syntax
+            updated_response = re.sub('( AUTH=%s)+' % capability, ' AUTH=PLAIN', str_response, flags=re.IGNORECASE)
+            if not re.search(' AUTH=PLAIN', updated_response, re.IGNORECASE):
                 # cannot just replace e.g., one 'CAPABILITY ' match because IMAP4 must be first if present (RFC 1730)
-                updated_response = re.sub(r'(CAPABILITY)( IMAP' + capability + r')?', r'\g<1>\g<2> AUTH=PLAIN',
-                                          updated_response, count=1, flags=re.IGNORECASE)
+                updated_response = re.sub('(CAPABILITY)( IMAP%s)?' % capability, r'\1\2 AUTH=PLAIN', updated_response,
+                                          count=1, flags=re.IGNORECASE)
             updated_response = updated_response.replace(' AUTH=PLAIN', '', updated_response.count(' AUTH=PLAIN') - 1)
-            if not re.search(r' SASL-IR', updated_response, re.IGNORECASE):
+            if not re.search(' SASL-IR', updated_response, re.IGNORECASE):
                 updated_response = updated_response.replace(' AUTH=PLAIN', ' AUTH=PLAIN SASL-IR')
-            updated_response = re.sub(r' LOGINDISABLED', '', updated_response, count=1, flags=re.IGNORECASE)
+            updated_response = re.sub(' LOGINDISABLED', '', updated_response, count=1, flags=re.IGNORECASE)
             byte_data = (b'%s\r\n' % updated_response.encode('utf-8'))
 
         super().process_data(byte_data)
@@ -1567,7 +1784,7 @@ class SMTPOAuth2ServerConnection(OAuth2ServerConnection):
             # intercept EHLO response AUTH capabilities and replace with what we can actually do - note that we assume
             # an AUTH line will be included in the response; if there are any servers for which this is not the case, we
             # could cache and re-stream as in POP. Formal syntax: https://tools.ietf.org/html/rfc4954#section-8
-            updated_response = re.sub(r'250([ -])AUTH( [!-*,-<>-~]+)+', '250\\1AUTH PLAIN LOGIN', str_data,
+            updated_response = re.sub('250([ -])AUTH( [!-*,-<>-~]+)+', r'250\1AUTH PLAIN LOGIN', str_data,
                                       flags=re.IGNORECASE)
             updated_response = b'%s\r\n' % updated_response.encode('utf-8')
             if self.starttls_state is self.STARTTLS.COMPLETE:
@@ -1677,7 +1894,7 @@ class OAuth2Proxy(asyncore.dispatcher):
             except Exception:
                 connection.close()
                 if new_server_connection:
-                    new_server_connection.handle_close()
+                    new_server_connection.close()
                 raise
         else:
             error_text = '%s rejecting new connection above MAX_CONNECTIONS limit of %d' % (
@@ -1694,22 +1911,32 @@ class OAuth2Proxy(asyncore.dispatcher):
             if not EXITING:
                 # OSError 9 = 'Bad file descriptor', thrown when closing connections after network interruption
                 if isinstance(e, OSError) and e.errno == errno.EBADF:
-                    Log.debug(client.info_string(), '[ Connection closed ]')
+                    Log.debug(client.info_string(), '[ Connection failed ]')
                 else:
                     Log.info(client.info_string(), 'Caught asyncore exception in thread loop:', Log.error_string(e))
 
     def start(self):
         Log.info('Starting', self.info_string())
-        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.create_socket()
         self.set_reuse_addr()
         self.bind(self.local_address)
         self.listen(5)
 
-    def create_socket(self, socket_family=socket.AF_INET, socket_type=socket.SOCK_STREAM):
-        if self.ssl_connection:
-            new_socket = socket.socket(socket_family, socket_type)
-            new_socket.setblocking(False)
+    def create_socket(self, socket_family=socket.AF_UNSPEC, socket_type=socket.SOCK_STREAM):
+        # listen using both IPv4 and IPv6 where possible (python 3.8 and later)
+        socket_family = socket.AF_INET6 if socket_family == socket.AF_UNSPEC else socket_family
+        if socket_family != socket.AF_INET:
+            try:
+                host, port = self.local_address
+                socket.getaddrinfo(host, port, socket_family, socket.SOCK_STREAM)
+            except OSError:
+                socket_family = socket.AF_INET
+        new_socket = socket.socket(socket_family, socket_type)
+        if socket_family == socket.AF_INET6 and getattr(socket, 'has_dualstack_ipv6', False):
+            new_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, False)
+        new_socket.setblocking(False)
 
+        if self.ssl_connection:
             # noinspection PyTypeChecker
             ssl_context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
             ssl_context.load_cert_chain(certfile=self.custom_configuration['local_certificate_path'],
@@ -1719,7 +1946,7 @@ class OAuth2Proxy(asyncore.dispatcher):
             self.set_socket(ssl_context.wrap_socket(new_socket, server_side=True, suppress_ragged_eofs=True,
                                                     do_handshake_on_connect=False))
         else:
-            super().create_socket(socket_family, socket_type)
+            self.set_socket(new_socket)
 
     def remove_client(self, client):
         if client in self.client_connections:  # remove closed clients
@@ -1751,13 +1978,12 @@ class OAuth2Proxy(asyncore.dispatcher):
         self.start()
 
     def handle_error(self):
-        error_type, value, _traceback = sys.exc_info()
-        del _traceback  # used to be required in python 2; may no-longer be needed, but best to be safe
-        if error_type == socket.gaierror and value.errno in [8, 11001] or \
+        error_type, value = Log.get_last_error()
+        if error_type == socket.gaierror and value.errno in [-2, 8, 11001] or \
                 error_type == TimeoutError and value.errno == errno.ETIMEDOUT or \
                 issubclass(error_type, ConnectionError) and value.errno in [errno.ECONNRESET, errno.ECONNREFUSED] or \
                 error_type == OSError and value.errno in [0, errno.EINVAL, errno.ENETDOWN, errno.EHOSTUNREACH]:
-            # gaierror 8 = 'nodename nor servname provided, or not known', gaierror 11001 = 'getaddrinfo failed' (caused
+            # gaierror -2 or 8 = 'nodename nor servname provided, or not known' / 11001 = 'getaddrinfo failed' (caused
             # by getpeername() failing due to no connection); TimeoutError 60 = 'Operation timed out'; ConnectionError
             # 54 = 'Connection reset by peer', 61 = 'Connection refused; OSError 0 = 'Error' (local SSL failure),
             # 22 = 'Invalid argument' (same cause as gaierror 11001), 50 = 'Network is down', 65 = 'No route to host'
@@ -1773,6 +1999,9 @@ class OAuth2Proxy(asyncore.dispatcher):
 
     def handle_close(self):
         # if we encounter an unhandled exception in asyncore, handle_close() is called; restart this server
+        error_type, value = Log.get_last_error()
+        if error_type and value:
+            Log.info(self.info_string(), 'Caught connection error -', error_type.__name__, ':', value)
         Log.info('Unexpected close of proxy connection - restarting', self.info_string())
         try:
             self.restart()
@@ -1898,30 +2127,42 @@ class App:
     """Manage the menu bar icon, server loading, authorisation and notifications, and start the main proxy thread"""
 
     def __init__(self):
-        global CONFIG_FILE_PATH
-        parser = argparse.ArgumentParser(description=APP_NAME)
-        parser.add_argument('--no-gui', action='store_true', help='start the proxy without a menu bar icon (note: '
-                                                                  'account authorisation requests will fail unless a '
-                                                                  'pre-authorised configuration file is used, or you '
-                                                                  'enable `--external-auth` or `--local-server-auth` '
-                                                                  'and monitor log output)')
-        parser.add_argument('--external-auth', action='store_true', help='handle authorisation externally: rather than '
-                                                                         'intercepting `redirect_uri`, the proxy will '
-                                                                         'wait for you to paste the result into either '
-                                                                         'its popup window (GUI-mode) or the terminal '
-                                                                         '(no-GUI mode; requires `prompt_toolkit`)')
-        parser.add_argument('--local-server-auth', action='store_true', help='handle authorisation by printing request '
-                                                                             'URLs to the log and starting a local web '
-                                                                             'server on demand to receive responses')
-        parser.add_argument('--config-file', default=None, help='the full path to the proxy\'s configuration file '
-                                                                '(optional; default: `%s` in the same directory as the '
-                                                                'proxy script)' % os.path.basename(CONFIG_FILE_PATH))
-        parser.add_argument('--log-file', default=None, help='the full path to a file where log output should be sent '
-                                                             '(optional; default behaviour varies by platform, but see '
-                                                             'Log.initialise() for details)')
-        parser.add_argument('--debug', action='store_true', help='enable debug mode, printing client<->proxy<->server '
-                                                                 'interaction to the system log')
-        parser.add_argument('--version', action='version', version='%s %s' % (APP_NAME, __version__))
+        global CONFIG_FILE_PATH, CACHE_STORE
+        parser = argparse.ArgumentParser(description='%s: transparently add OAuth 2.0 support to IMAP/POP/SMTP client '
+                                                     'applications, scripts or any other email use-cases that don\'t '
+                                                     'support this authentication method.' % APP_NAME, add_help=False,
+                                         epilog='Full readme and guide: https://github.com/simonrob/email-oauth2-proxy')
+        group_gui = parser.add_argument_group(title='appearance')
+        group_gui.add_argument('--no-gui', action='store_true',
+                               help='start the proxy without a menu bar icon (note: account authorisation requests '
+                                    'will fail unless a pre-authorised `--config-file` is used, or you use '
+                                    '`--external-auth` or `--local-server-auth` and monitor log/terminal output)')
+        group_auth = parser.add_argument_group('authentication methods')
+        group_auth.add_argument('--external-auth', action='store_true',
+                                help='handle authorisation externally: rather than intercepting `redirect_uri`, the '
+                                     'proxy will wait for you to paste the result into either its popup window (GUI '
+                                     'mode) or the terminal (no-GUI mode; requires `prompt_toolkit`)')
+        group_auth.add_argument('--local-server-auth', action='store_true',
+                                help='handle authorisation by printing request URLs to the log and starting a local '
+                                     'web server on demand to receive responses')
+        group_config = parser.add_argument_group('server, account and runtime configuration')
+        group_config.add_argument('--config-file', default=None,
+                                  help='the full path to the proxy\'s configuration file (optional; default: `%s` in '
+                                       'the same directory as the proxy script)' % os.path.basename(CONFIG_FILE_PATH))
+        group_config.add_argument('--cache-store', default=None,
+                                  help='the full path to a local file to use for credential caching (optional; '
+                                       'default: save to `--config-file`); alternatively, an external store such as a '
+                                       'secrets manager can be used - see readme for instructions and requirements')
+        group_debug = parser.add_argument_group('logging, debugging and help')
+        group_debug.add_argument('--log-file', default=None,
+                                 help='the full path to a file where log output should be sent (optional; default log '
+                                      'behaviour varies by platform - see readme for details)')
+        group_debug.add_argument('--debug', action='store_true',
+                                 help='enable debug mode, sending all client<->proxy<->server communication to the '
+                                      'proxy\'s log')
+        group_debug.add_argument('--version', action='version', version='%s %s' % (APP_NAME, __version__),
+                                 help='show the proxy\'s version string and exit')
+        group_debug.add_argument('-h', '--help', action='help', help='show this help message and exit')
 
         self.args = parser.parse_args()
 
@@ -1930,7 +2171,9 @@ class App:
             Log.set_level(logging.DEBUG)
 
         if self.args.config_file:
-            CONFIG_FILE_PATH = self.args.config_file
+            CONFIG_FILE_PATH = CACHE_STORE = self.args.config_file
+        if self.args.cache_store:
+            CACHE_STORE = self.args.cache_store
 
         self.proxies = []
         self.authorisation_requests = []
@@ -2075,6 +2318,7 @@ class App:
         font = ImageFont.truetype(io.BytesIO(zlib.decompress(base64.b64decode(APP_ICON))), size=font_size)
 
         # pillow's getsize method was deprecated in 9.2.0 (see docs for PIL.ImageFont.ImageFont.getsize)
+        # noinspection PyDeprecation
         if pkg_resources.parse_version(
                 pkg_resources.get_distribution('pillow').version) < pkg_resources.parse_version('9.2.0'):
             font_width, font_height = font.getsize(text)
@@ -2086,10 +2330,8 @@ class App:
     def create_config_menu(self):
         items = []
         if len(self.proxies) <= 0:
-            # note that we don't actually allow no servers when loading config, but just in case that behaviour changes
-            items.append(pystray.MenuItem('Servers:', None, enabled=False))
-            items.append(pystray.MenuItem('    No servers configured', None, enabled=False))
-            items.append(pystray.Menu.SEPARATOR)
+            # note that we don't actually allow no servers when loading the config, so no need to generate a menu
+            return items  # (avoids creating and then immediately regenerating the menu when servers are loaded)
         else:
             for server_type in ['IMAP', 'POP', 'SMTP']:
                 items.extend(App.get_config_menu_servers(self.proxies, server_type))
@@ -2219,6 +2461,7 @@ class App:
         setattr(authorisation_window, 'get_title', lambda window: window.title)  # add missing get_title method
 
         # pywebview 3.6+ moved window events to a separate namespace in a non-backwards-compatible way
+        # noinspection PyDeprecation
         if pkg_resources.parse_version(
                 pkg_resources.get_distribution('pywebview').version) < pkg_resources.parse_version('3.6'):
             authorisation_window.loaded += self.authorisation_window_loaded
@@ -2238,10 +2481,13 @@ class App:
         setattr(webview.platforms.cocoa.BrowserView.BrowserDelegate, 'webView_didReceiveServerRedirectForProvisional'
                                                                      'Navigation_',
                 ProvisionalNavigationBrowserDelegate.webView_didReceiveServerRedirectForProvisionalNavigation_)
-        setattr(webview.platforms.cocoa.BrowserView.WebKitHost, 'performKeyEquivalentBase_',
-                webview.platforms.cocoa.BrowserView.WebKitHost.performKeyEquivalent_)
-        setattr(webview.platforms.cocoa.BrowserView.WebKitHost, 'performKeyEquivalent_',
-                ProvisionalNavigationBrowserDelegate.performKeyEquivalent_)
+        try:
+            setattr(webview.platforms.cocoa.BrowserView.WebKitHost, 'performKeyEquivalentBase_',
+                    webview.platforms.cocoa.BrowserView.WebKitHost.performKeyEquivalent_)
+            setattr(webview.platforms.cocoa.BrowserView.WebKitHost, 'performKeyEquivalent_',
+                    ProvisionalNavigationBrowserDelegate.performKeyEquivalent_)
+        except TypeError:
+            pass
 
         # also needed only on macOS because otherwise closing the last remaining webview window exits the application
         dummy_window = webview.create_window('%s hidden (dummy) window' % APP_NAME, html='<html></html>', hidden=True)
@@ -2389,7 +2635,7 @@ class App:
         if self.args.external_auth:
             script_command.append('--external-auth')
 
-        return ['"%s"' % arg.replace('"', '\\"') if quote_args and ' ' in arg else arg for arg in script_command]
+        return ['"%s"' % arg.replace('"', r'\"') if quote_args and ' ' in arg else arg for arg in script_command]
 
     def linux_restart(self, icon):
         # Linux restarting is separate because it is used for reloading the configuration file as well as start at login
@@ -2450,7 +2696,7 @@ class App:
                     notification_centre.setDelegate_(self.macos_user_notification_centre_delegate)
                     notification_centre.deliverNotification_(user_notification)
                 except Exception:
-                    for replacement in (('\\', '\\\\'), ('"', '\\"')):  # osascript approach requires sanitisation
+                    for replacement in (('\\', r'\\'), ('"', r'\"')):  # osascript approach requires sanitisation
                         text = text.replace(*replacement)
                         title = title.replace(*replacement)
                     subprocess.call(['osascript', '-e', 'display notification "%s" with title "%s"' % (text, title)])
