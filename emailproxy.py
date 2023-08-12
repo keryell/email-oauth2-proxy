@@ -6,7 +6,7 @@
 __author__ = 'Simon Robinson'
 __copyright__ = 'Copyright (c) 2023 Simon Robinson'
 __license__ = 'Apache 2.0'
-__version__ = '2023-07-12'  # ISO 8601 (YYYY-MM-DD)
+__version__ = '2023-08-11'  # ISO 8601 (YYYY-MM-DD)
 
 import abc
 import argparse
@@ -68,8 +68,10 @@ no_gui_parser.add_argument('--no-gui', action='store_true')
 no_gui_parser.add_argument('--external-auth', action='store_true')
 no_gui_args = no_gui_parser.parse_known_args()[0]
 if not no_gui_args.no_gui:
-    # noinspection PyDeprecation
-    import pkg_resources  # from setuptools - to be changed to importlib.metadata and packaging.version once 3.8 is min.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        # noinspection PyDeprecation
+        import pkg_resources  # from setuptools - to change to importlib.metadata and packaging.version once min. is 3.8
     import pystray  # the menu bar/taskbar GUI
     import timeago  # the last authenticated activity hint
     from PIL import Image, ImageDraw, ImageFont  # draw the menu bar icon from the TTF font stored in APP_ICON
@@ -159,6 +161,7 @@ REQUEST_QUEUE = queue.Queue()  # requests for authentication
 RESPONSE_QUEUE = queue.Queue()  # responses from user
 WEBVIEW_QUEUE = queue.Queue()  # authentication window events (macOS only)
 QUEUE_SENTINEL = object()  # object to send to signify queues should exit loops
+MENU_UPDATE = object()  # object to send to trigger a force-refresh of the GUI menu (new catch-all account added)
 
 PLIST_FILE_PATH = pathlib.Path('~/Library/LaunchAgents/%s.plist' % APP_PACKAGE).expanduser()  # launchctl file location
 CMD_FILE_PATH = pathlib.Path('~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/%s.cmd' %
@@ -681,6 +684,7 @@ class OAuth2Helper:
                 access_token = response['access_token']
                 if not config.has_section(username):
                     AppConfig.add_account(username)  # in wildcard mode the section may not yet exist
+                    REQUEST_QUEUE.put(MENU_UPDATE)  # make sure the menu shows the newly-added account
                 config.set(username, 'token_salt', token_salt)
                 config.set(username, 'access_token', OAuth2Helper.encrypt(fernet, access_token))
                 config.set(username, 'access_token_expiry', str(current_time + response['expires_in']))
@@ -1203,7 +1207,10 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
     def handle_close(self):
         error_type, value = Log.get_last_error()
         if error_type and value:
-            Log.info(self.info_string(), 'Caught connection error (client) -', error_type.__name__, ':', value)
+            message = 'Caught connection error (client)'
+            if error_type == ConnectionResetError:
+                message = '%s [ Are you attempting an encrypted connection to a non-encrypted server? ]' % message
+            Log.info(self.info_string(), message, '-', error_type.__name__, ':', value)
         self.close()
 
     def close(self):
@@ -1608,9 +1615,10 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
         error_type, value = Log.get_last_error()
         if error_type == TimeoutError and value.errno == errno.ETIMEDOUT or \
                 issubclass(error_type, ConnectionError) and value.errno in [errno.ECONNRESET, errno.ECONNREFUSED] or \
-                error_type == OSError and value.errno in [0, errno.ENETDOWN, errno.EHOSTUNREACH]:
+                error_type == OSError and value.errno in [0, errno.ENETDOWN, errno.EHOSTDOWN, errno.EHOSTUNREACH]:
             # TimeoutError 60 = 'Operation timed out'; ConnectionError 54 = 'Connection reset by peer', 61 = 'Connection
-            # refused;  OSError 0 = 'Error' (typically network failure), 50 = 'Network is down', 65 = 'No route to host'
+            # refused;  OSError 0 = 'Error' (typically network failure), 50 = 'Network is down', 64 = 'Host is down';
+            # 65 = 'No route to host'
             Log.info(self.info_string(), 'Caught network error (server) - is there a network connection?',
                      'Error type', error_type, 'with message:', value)
             self.close()
@@ -2280,6 +2288,7 @@ class App:
             self.exit(self.icon)
 
     def create_icon(self):
+        Image.ANTIALIAS = Image.LANCZOS  # temporary fix for pystray incompatibility with PIL >= 10.0.0
         icon_class = RetinaIcon if sys.platform == 'darwin' else pystray.Icon
         return icon_class(APP_NAME, App.get_image(), APP_NAME, menu=pystray.Menu(
             pystray.MenuItem('Servers and accounts', pystray.Menu(self.create_config_menu)),
@@ -2880,6 +2889,10 @@ class App:
         while True:
             data = REQUEST_QUEUE.get()  # note: blocking call
             if data is QUEUE_SENTINEL:  # app is closing
+                break
+            if data is MENU_UPDATE:
+                if icon:
+                    icon.update_menu()
                 break
             if not data['expired']:
                 Log.info('Authorisation request received for', data['username'],
