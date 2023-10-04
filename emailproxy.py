@@ -6,7 +6,7 @@
 __author__ = 'Simon Robinson'
 __copyright__ = 'Copyright (c) 2023 Simon Robinson'
 __license__ = 'Apache 2.0'
-__version__ = '2023-08-11'  # ISO 8601 (YYYY-MM-DD)
+__version__ = '2023-09-21'  # ISO 8601 (YYYY-MM-DD)
 
 import abc
 import argparse
@@ -123,6 +123,7 @@ APP_ICON = b'''eNp1Uc9rE0EUfjM7u1nyq0m72aQxpnbTbFq0TbJNNkGkNpVKb2mxtgjWsqRJU+jaQ
     J6Sp0urC5fCken5STr0KDoUlyhjVd4nxSUvq3tCftEn8r2ro+mxUDIaCMQmQrGZGHmi53tAT3rPGH1e3qF0p9w7LtcohwuyvnRxWZ8sZUej6WvlhXSk1
     7k+POJ1iR73N/+w2xN0f4+GJcHtfqoWzgfi6cuZscC54lSq3SbN1tmzC4MXtcwN/zOC78r9BIfNc3M='''  # TTF ('e') -> zlib -> base64
 
+CENSOR_CREDENTIALS = True
 CENSOR_MESSAGE = b'[[ Credentials removed from proxy log ]]'  # replaces actual credentials; must be a byte-type string
 
 script_path = sys.executable if getattr(sys, 'frozen', False) else os.path.realpath(__file__)  # for pyinstaller etc
@@ -405,15 +406,59 @@ class AWSSecretsManagerCacheStore(CacheStore):
             Log.error('Unable to get AWS SDK client; cannot cache credentials to AWS Secrets Manager')
 
 
+class ConcurrentConfigParser:
+    """Helper wrapper to add locking to a ConfigParser object (note: only wraps the methods used in this script)"""
+
+    def __init__(self):
+        self.config = configparser.ConfigParser()
+        self.lock = threading.Lock()
+
+    def read(self, filename):
+        with self.lock:
+            self.config.read(filename)
+
+    def sections(self):
+        with self.lock:
+            return self.config.sections()
+
+    def add_section(self, section):
+        with self.lock:
+            self.config.add_section(section)
+
+    def get(self, section, option, fallback=None):
+        with self.lock:
+            return self.config.get(section, option, fallback=fallback)
+
+    def getint(self, section, option, fallback=None):
+        with self.lock:
+            return self.config.getint(section, option, fallback=fallback)
+
+    def getboolean(self, section, option, fallback=None):
+        with self.lock:
+            return self.config.getboolean(section, option, fallback=fallback)
+
+    def set(self, section, option, value):
+        with self.lock:
+            self.config.set(section, option, value)
+
+    def remove_option(self, section, option):
+        with self.lock:
+            self.config.remove_option(section, option)
+
+    def write(self, file):
+        with self.lock:
+            self.config.write(file)
+
+    def items(self):
+        with self.lock:
+            return self.config.items()  # used in read_dict when saving to cache store
+
+
 class AppConfig:
     """Helper wrapper around ConfigParser to cache servers/accounts, and avoid writing to the file until necessary"""
 
     _PARSER = None
-    _LOADED = False
-
-    _GLOBALS = None
-    _SERVERS = []
-    _ACCOUNTS = []
+    _PARSER_LOCK = threading.Lock()
 
     # note: removing the unencrypted version of `client_secret_encrypted` is not automatic with --cache-store (see docs)
     _CACHED_OPTION_KEYS = ['token_salt', 'access_token', 'access_token_expiry', 'refresh_token', 'last_activity',
@@ -424,38 +469,26 @@ class AppConfig:
 
     @staticmethod
     def _load():
-        AppConfig.unload()
-        AppConfig._PARSER = configparser.ConfigParser()
-        AppConfig._PARSER.read(CONFIG_FILE_PATH)
-
-        config_sections = AppConfig._PARSER.sections()
-        if APP_SHORT_NAME in config_sections:
-            AppConfig._GLOBALS = AppConfig._PARSER[APP_SHORT_NAME]
-        else:
-            AppConfig._GLOBALS = configparser.SectionProxy(AppConfig._PARSER, APP_SHORT_NAME)
+        config_parser = ConcurrentConfigParser()
+        config_parser.read(CONFIG_FILE_PATH)
 
         # cached account credentials can be stored in the configuration file (default) or, via `--cache-store`, a
         # separate local file or external service (such as a secrets manager) - we combine these sources at load time
         if CACHE_STORE != CONFIG_FILE_PATH:
             # it would be cleaner to avoid specific options here, but best to load unexpected sections only when enabled
-            allow_catch_all_accounts = AppConfig._GLOBALS.getboolean('allow_catch_all_accounts', fallback=False)
+            allow_catch_all_accounts = config_parser.getboolean(APP_SHORT_NAME, 'allow_catch_all_accounts',
+                                                                fallback=False)
 
             cache_file_parser = AppConfig._load_cache(CACHE_STORE)
             cache_file_accounts = [s for s in cache_file_parser.sections() if '@' in s]
             for account in cache_file_accounts:
-                if allow_catch_all_accounts and account not in AppConfig._PARSER.sections():  # missing sub-accounts
-                    AppConfig._PARSER.add_section(account)
+                if allow_catch_all_accounts and account not in config_parser.sections():  # missing sub-accounts
+                    config_parser.add_section(account)
                 for option in cache_file_parser.options(account):
                     if option in AppConfig._CACHED_OPTION_KEYS:
-                        AppConfig._PARSER.set(account, option, cache_file_parser.get(account, option))
+                        config_parser.set(account, option, cache_file_parser.get(account, option))
 
-            if allow_catch_all_accounts:
-                config_sections = AppConfig._PARSER.sections()  # new sections may have been added
-
-        AppConfig._SERVERS = [s for s in config_sections if CONFIG_SERVER_MATCHER.match(s)]
-        AppConfig._ACCOUNTS = [s for s in config_sections if '@' in s]
-
-        AppConfig._LOADED = True
+        return config_parser
 
     @staticmethod
     def _load_cache(cache_store_identifier):
@@ -469,59 +502,47 @@ class AppConfig:
 
     @staticmethod
     def get():
-        if not AppConfig._LOADED:
-            AppConfig._load()
-        return AppConfig._PARSER
+        with AppConfig._PARSER_LOCK:
+            if AppConfig._PARSER is None:
+                AppConfig._PARSER = AppConfig._load()
+            return AppConfig._PARSER
 
     @staticmethod
     def unload():
-        AppConfig._PARSER = None
-        AppConfig._LOADED = False
-
-        AppConfig._GLOBALS = None
-        AppConfig._SERVERS = []
-        AppConfig._ACCOUNTS = []
+        with AppConfig._PARSER_LOCK:
+            AppConfig._PARSER = None
 
     @staticmethod
-    def reload():
-        AppConfig.unload()
-        return AppConfig.get()
-
-    @staticmethod
-    def globals():
-        AppConfig.get()  # make sure config is loaded
-        return AppConfig._GLOBALS
+    def get_global(name, fallback):
+        return AppConfig.get().getboolean(APP_SHORT_NAME, name, fallback)
 
     @staticmethod
     def servers():
-        AppConfig.get()  # make sure config is loaded
-        return AppConfig._SERVERS
+        return [s for s in AppConfig.get().sections() if CONFIG_SERVER_MATCHER.match(s)]
 
     @staticmethod
     def accounts():
-        AppConfig.get()  # make sure config is loaded
-        return AppConfig._ACCOUNTS
-
-    @staticmethod
-    def add_account(username):
-        AppConfig._PARSER.add_section(username)
-        AppConfig._ACCOUNTS = [s for s in AppConfig._PARSER.sections() if '@' in s]
+        return [s for s in AppConfig.get().sections() if '@' in s]
 
     @staticmethod
     def save():
-        if AppConfig._LOADED:
+        with AppConfig._PARSER_LOCK:
+            if AppConfig._PARSER is None:  # intentionally using _PARSER not get() so we don't (re-)load if unloaded
+                return
+
             if CACHE_STORE != CONFIG_FILE_PATH:
                 # in `--cache-store` mode we ignore everything except _CACHED_OPTION_KEYS (OAuth 2.0 tokens, etc)
                 output_config_parser = configparser.ConfigParser()
                 output_config_parser.read_dict(AppConfig._PARSER)  # a deep copy of the current configuration
+                config_accounts = [s for s in output_config_parser.sections() if '@' in s]
 
-                for account in AppConfig._ACCOUNTS:
+                for account in config_accounts:
                     for option in output_config_parser.options(account):
                         if option not in AppConfig._CACHED_OPTION_KEYS:
                             output_config_parser.remove_option(account, option)
 
                 for section in output_config_parser.sections():
-                    if section not in AppConfig._ACCOUNTS or len(output_config_parser.options(section)) <= 0:
+                    if section not in config_accounts or len(output_config_parser.options(section)) <= 0:
                         output_config_parser.remove_section(section)
 
                 AppConfig._save_cache(CACHE_STORE, output_config_parser)
@@ -550,17 +571,21 @@ class AppConfig:
 
 
 class OAuth2Helper:
+    class TokenRefreshError(Exception):
+        pass
+
     @staticmethod
-    def get_oauth2_credentials(username, password, recurse_retries=True):
+    def get_oauth2_credentials(username, password, reload_remote_accounts=True):
         """Using the given username (i.e., email address) and password, reads account details from AppConfig and
         handles OAuth 2.0 token request and renewal, saving the updated details back to AppConfig (or removing them
         if invalid). Returns either (True, '[OAuth2 string for authentication]') or (False, '[Error message]')"""
 
         # we support broader catch-all account names (e.g., `@domain.com` / `@`) if enabled
-        valid_accounts = [username in AppConfig.accounts()]
-        if AppConfig.globals().getboolean('allow_catch_all_accounts', fallback=False):
+        config_accounts = AppConfig.accounts()
+        valid_accounts = [username in config_accounts]
+        if AppConfig.get_global('allow_catch_all_accounts', fallback=False):
             user_domain = '@%s' % username.split('@')[-1]
-            valid_accounts.extend([account in AppConfig.accounts() for account in [user_domain, '@']])
+            valid_accounts.extend([account in config_accounts for account in [user_domain, '@']])
 
         if not any(valid_accounts):
             Log.error('Proxy config file entry missing for account', username, '- aborting login')
@@ -572,7 +597,7 @@ class OAuth2Helper:
 
         def get_account_with_catch_all_fallback(option):
             fallback = None
-            if AppConfig.globals().getboolean('allow_catch_all_accounts', fallback=False):
+            if AppConfig.get_global('allow_catch_all_accounts', fallback=False):
                 fallback = config.get(user_domain, option, fallback=config.get('@', option, fallback=None))
             return config.get(username, option, fallback=fallback)
 
@@ -613,9 +638,9 @@ class OAuth2Helper:
         refresh_token = config.get(username, 'refresh_token', fallback=None)
 
         # try reloading remotely cached tokens if possible
-        if not access_token and CACHE_STORE != CONFIG_FILE_PATH and recurse_retries:
-            AppConfig.reload()
-            return OAuth2Helper.get_oauth2_credentials(username, password, recurse_retries=False)
+        if not access_token and CACHE_STORE != CONFIG_FILE_PATH and reload_remote_accounts:
+            AppConfig.unload()
+            return OAuth2Helper.get_oauth2_credentials(username, password, reload_remote_accounts=False)
 
         # we hash locally-stored tokens with the given password
         if not token_salt:
@@ -636,8 +661,8 @@ class OAuth2Helper:
             if client_secret_encrypted and not client_secret:
                 client_secret = OAuth2Helper.decrypt(fernet, client_secret_encrypted)
 
-            if access_token:
-                if access_token_expiry - current_time < TOKEN_EXPIRY_MARGIN:  # refresh if expiring soon (if possible)
+            if access_token or refresh_token:  # if possible, refresh the existing token(s)
+                if not access_token or access_token_expiry - current_time < TOKEN_EXPIRY_MARGIN:
                     if refresh_token:
                         response = OAuth2Helper.refresh_oauth2_access_token(token_url, client_id, client_secret,
                                                                             OAuth2Helper.decrypt(fernet, refresh_token))
@@ -682,8 +707,8 @@ class OAuth2Helper:
                                                                         oauth2_flow, username, password)
 
                 access_token = response['access_token']
-                if not config.has_section(username):
-                    AppConfig.add_account(username)  # in wildcard mode the section may not yet exist
+                if username not in config.sections():
+                    config.add_section(username)  # in catch-all mode the section may not yet exist
                     REQUEST_QUEUE.put(MENU_UPDATE)  # make sure the menu shows the newly-added account
                 config.set(username, 'token_salt', token_salt)
                 config.set(username, 'access_token', OAuth2Helper.encrypt(fernet, access_token))
@@ -695,7 +720,7 @@ class OAuth2Helper:
                     Log.info('Warning: no refresh token returned for', username, '- you will need to re-authenticate',
                              'each time the access token expires (does your `oauth2_scope` value allow `offline` use?)')
 
-                if AppConfig.globals().getboolean('encrypt_client_secret_on_first_use', fallback=False):
+                if AppConfig.get_global('encrypt_client_secret_on_first_use', fallback=False):
                     if client_secret:
                         # note: save to the `username` entry even if `user_domain` exists, avoiding conflicts when using
                         # incompatible `encrypt_client_secret_on_first_use` and `allow_catch_all_accounts` options
@@ -709,23 +734,34 @@ class OAuth2Helper:
             oauth2_string = OAuth2Helper.construct_oauth2_string(username, access_token)
             return True, oauth2_string
 
-        except InvalidToken as e:
-            # if invalid details are the reason for failure we remove our cached version and re-authenticate - this can
-            # be disabled by a configuration setting, but note that we always remove credentials on 400 Bad Request
-            if e.args == (400, APP_PACKAGE) or AppConfig.globals().getboolean('delete_account_token_on_password_error',
-                                                                              fallback=True):
+        except OAuth2Helper.TokenRefreshError as e:
+            # always clear access tokens - can easily request another via the refresh token (with no user interaction)
+            has_access_token = True if config.get(username, 'access_token', fallback=None) else False
+            config.remove_option(username, 'access_token')
+            config.remove_option(username, 'access_token_expiry')
+
+            if not has_access_token:
+                # if this is already a second failure, remove the refresh token as well, and force re-authentication
                 config.remove_option(username, 'token_salt')
+                config.remove_option(username, 'refresh_token')
+
+            AppConfig.save()
+
+            Log.info('Retrying login due to exception while refreshing OAuth 2.0 tokens for', username,
+                     '(attempt %d):' % (1 if has_access_token else 2), Log.error_string(e))
+            return OAuth2Helper.get_oauth2_credentials(username, password, reload_remote_accounts=False)
+
+        except InvalidToken as e:
+            if AppConfig.get_global('delete_account_token_on_password_error', fallback=True):
                 config.remove_option(username, 'access_token')
                 config.remove_option(username, 'access_token_expiry')
+                config.remove_option(username, 'token_salt')
                 config.remove_option(username, 'refresh_token')
                 AppConfig.save()
-            else:
-                recurse_retries = False  # no need to recurse if we are just trying the same credentials again
 
-            if recurse_retries:
-                Log.info('Retrying login due to exception while requesting OAuth 2.0 credentials for %s:' % username,
-                         Log.error_string(e))
-                return OAuth2Helper.get_oauth2_credentials(username, password, recurse_retries=False)
+                Log.info('Retrying login due to exception while decrypting OAuth 2.0 credentials for', username,
+                         '(invalid password):', Log.error_string(e))
+                return OAuth2Helper.get_oauth2_credentials(username, password, reload_remote_accounts=False)
 
             Log.error('Invalid password to decrypt', username, 'credentials - aborting login:', Log.error_string(e))
             return False, '%s: Login failed - the password for account %s is incorrect' % (APP_NAME, username)
@@ -932,8 +968,8 @@ class OAuth2Helper:
         except urllib.error.HTTPError as e:
             e.message = json.loads(e.read())
             Log.debug('Error refreshing access token - received invalid response:', e.message)
-            if e.code == 400:  # 400 Bad Request typically means re-authentication is required (refresh token expired)
-                raise InvalidToken(e.code, APP_PACKAGE) from e
+            if e.code == 400:  # 400 Bad Request typically means re-authentication is required (token expired)
+                raise OAuth2Helper.TokenRefreshError from e
             raise e
 
     @staticmethod
@@ -1179,7 +1215,7 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
                     log_data = re.sub(b'(%s)?( )?(AUTH)(ENTICATE)? (PLAIN|LOGIN) (.*)\r\n' % tag_pattern,
                                       br'\1\2\3\4 \5 ' + CENSOR_MESSAGE + b'\r\n', log_data, flags=re.IGNORECASE)
 
-                Log.debug(self.info_string(), '-->', log_data)
+                Log.debug(self.info_string(), '-->', log_data if CENSOR_CREDENTIALS else line)
                 try:
                     self.process_data(line)
                 except AttributeError:  # AttributeError("'NoneType' object has no attribute 'username'"), etc
@@ -1608,7 +1644,8 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
 
     def send(self, byte_data, censor_log=False):
         if not self.client_connection.authenticated:  # after authentication these are identical to server-side logs
-            Log.debug(self.info_string(), '    -->', b'%s\r\n' % CENSOR_MESSAGE if censor_log else byte_data)
+            Log.debug(self.info_string(), '    -->',
+                      b'%s\r\n' % CENSOR_MESSAGE if CENSOR_CREDENTIALS and censor_log else byte_data)
         return super().send(byte_data)
 
     def handle_error(self):
@@ -1957,8 +1994,11 @@ class OAuth2Proxy(asyncore.dispatcher):
         if self.ssl_connection:
             # noinspection PyTypeChecker
             ssl_context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
-            ssl_context.load_cert_chain(certfile=self.custom_configuration['local_certificate_path'],
-                                        keyfile=self.custom_configuration['local_key_path'])
+            try:
+                ssl_context.load_cert_chain(certfile=self.custom_configuration['local_certificate_path'],
+                                            keyfile=self.custom_configuration['local_key_path'])
+            except FileNotFoundError as e:
+                raise FileNotFoundError('Unable to open `local_certificate_path` and/or `local_key_path`') from e
 
             # suppress_ragged_eofs=True: see test_ssl.py documentation in https://github.com/python/cpython/pull/5266
             self.set_socket(ssl_context.wrap_socket(new_socket, server_side=True, suppress_ragged_eofs=True,
@@ -2287,8 +2327,16 @@ class App:
             Log.info('Received power off notification; exiting', APP_NAME)
             self.exit(self.icon)
 
+    # noinspection PyDeprecation
     def create_icon(self):
-        Image.ANTIALIAS = Image.LANCZOS  # temporary fix for pystray incompatibility with PIL >= 10.0.0
+        # temporary fix for pystray <= 0.19.4 incompatibility with PIL 10.0.0+; fixed once pystray PR #147 is released
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', DeprecationWarning)
+            pystray_version = pkg_resources.get_distribution('pystray').version
+            pillow_version = pkg_resources.get_distribution('pillow').version
+            if pkg_resources.parse_version(pystray_version) <= pkg_resources.parse_version('0.19.4') and \
+                    pkg_resources.parse_version(pillow_version) >= pkg_resources.parse_version('10.0.0'):
+                Image.ANTIALIAS = Image.LANCZOS
         icon_class = RetinaIcon if sys.platform == 'darwin' else pystray.Icon
         return icon_class(APP_NAME, App.get_image(), APP_NAME, menu=pystray.Menu(
             pystray.MenuItem('Servers and accounts', pystray.Menu(self.create_config_menu)),
@@ -2302,11 +2350,22 @@ class App:
     @staticmethod
     def get_image():
         # we use an icon font for better multiplatform compatibility and icon size flexibility
-        icon_colour = 'white'  # note: value is irrelevant on macOS - we set as a template to get the platform's colours
+        icon_colour = 'white'  # see below: colour is handled differently per-platform
         icon_character = 'e'
         icon_background_width = 44
         icon_background_height = 44
         icon_width = 40  # to allow for padding between icon and background image size
+
+        # the colour value is irrelevant on macOS - we configure the menu bar icon as a template to get the platform's
+        # colours - but on Windows (and in future potentially Linux) we need to set based on the current theme type
+        if sys.platform == 'win32':
+            import winreg
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                     r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize')
+                icon_colour = 'black' if winreg.QueryValueEx(key, 'SystemUsesLightTheme')[0] else 'white'
+            except FileNotFoundError:
+                pass
 
         # find the largest font size that will let us draw the icon within the available width
         minimum_font_size = 1
@@ -2360,7 +2419,7 @@ class App:
         if len(config_accounts) <= 0:
             items.append(pystray.MenuItem('    No accounts configured', None, enabled=False))
         else:
-            catch_all_enabled = AppConfig.globals().getboolean('allow_catch_all_accounts', fallback=False)
+            catch_all_enabled = AppConfig.get_global('allow_catch_all_accounts', fallback=False)
             catch_all_accounts = []
             for account in config_accounts:
                 if account.startswith('@') and catch_all_enabled:
@@ -2750,7 +2809,9 @@ class App:
         # we allow reloading, so must first stop any existing servers
         self.stop_servers()
         Log.info('Initialising', APP_NAME, '(version %s)' % __version__, 'from config file', CONFIG_FILE_PATH)
-        config = AppConfig.reload() if reload else AppConfig.get()
+        if reload:
+            AppConfig.unload()
+        config = AppConfig.get()
 
         # load server types and configurations
         server_load_error = False
@@ -2893,7 +2954,7 @@ class App:
             if data is MENU_UPDATE:
                 if icon:
                     icon.update_menu()
-                break
+                continue
             if not data['expired']:
                 Log.info('Authorisation request received for', data['username'],
                          '(local server auth mode)' if self.args.local_server_auth else '(external auth mode)' if
